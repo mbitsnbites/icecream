@@ -43,6 +43,7 @@
 #include <list>
 #include <map>
 #include <queue>
+#include <set>
 #include <algorithm>
 #include <cassert>
 #include <fstream>
@@ -120,6 +121,11 @@ static list<UnansweredList *> toanswer;
 
 static list<JobStat> all_job_stats;
 static JobStat cum_job_stats;
+
+/* blacklist state (default is that there is no blacklist) */
+static set<string> blacklist;
+static off_t blacklist_file_size = 0;
+static time_t blacklist_mtime = 0;
 
 static float server_speed(CompileServer *cs, Job *job = 0);
 
@@ -511,6 +517,56 @@ static string envs_match(CompileServer *cs, const Job *job)
     return string();
 }
 
+static void update_blacklist()
+{
+    /* get the blacklist configuration file path */
+    const char *blacklist_file = getenv("ICECC_BLACKLIST_FILE");
+    if (blacklist_file == NULL) {
+        blacklist_file = "/etc/icecc/blacklist.conf";
+    }
+
+    /* check the modification time and size (i.e. has it been updated?) */
+    struct stat stat_buf;
+    if (stat(blacklist_file, &stat_buf) != 0)
+    {
+        return;
+    }
+    if ((stat_buf.st_size == blacklist_file_size) && (stat_buf.st_mtime == blacklist_mtime))
+    {
+        return;
+    }
+
+    /* read the blacklist from the file */
+    blacklist.clear();
+    ifstream f(blacklist_file, ios_base::in | ios_base::binary);
+    if (f.bad())
+    {
+        log_error() << "Unable to read the blacklist file " << blacklist_file;
+        return;
+    }
+    string line;
+    while (getline(f, line))
+    {
+        if ((line.size() > 0) && (line[0] != '#') && (blacklist.find(line) == blacklist.end()))
+        {
+            blacklist.insert(line);
+        }
+    }
+    f.close();
+
+    /* update the last read modification time and size */
+    blacklist_file_size = stat_buf.st_size;
+    blacklist_mtime = stat_buf.st_mtime;
+
+    log_info() << "Read " << blacklist.size() << " blacklist items from " << blacklist_file << endl;
+}
+
+static bool is_not_blacklisted(CompileServer *cs)
+{
+    bool is_blacklisted = (blacklist.find(cs->nodeName()) != blacklist.end());
+    return !is_blacklisted;
+}
+
 static CompileServer *pick_server(Job *job)
 {
 #if DEBUG_SCHEDULER > 1
@@ -553,13 +609,16 @@ static CompileServer *pick_server(Job *job)
         return 0;
     }
 
+    /* update the blacklist */
+    update_blacklist();
+
     /* If we have no statistics simply use any server which is usable.  */
     if (!all_job_stats.size ()) {
         CompileServer *selected = NULL;
         int eligible_count = 0;
 
         for (list<CompileServer *>::iterator it = css.begin(); it != css.end(); ++it) {
-            if ((*it)->is_eligible( job )) {
+            if (is_not_blacklisted(*it) && (*it)->is_eligible( job )) {
                 ++eligible_count;
                 // Do not select the first one (which could be broken and so we might never get job stats),
                 // but rather select randomly.
@@ -598,7 +657,7 @@ static CompileServer *pick_server(Job *job)
         }
 
         // Ignore ineligible servers
-        if (!cs->is_eligible(job)) {
+        if (!(is_not_blacklisted(cs) && cs->is_eligible(job))) {
             trace() << cs->nodeName() << " not eligible" << endl;
             continue;
         }
